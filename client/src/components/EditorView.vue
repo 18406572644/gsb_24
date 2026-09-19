@@ -5,6 +5,14 @@ import { useSessionStore } from '@/stores/session'
 import { useDocStore } from '@/stores/doc'
 import { collab } from '@/collab/collab'
 import { mapPosition } from '../../../shared/ot'
+import {
+  COUNT_THROTTLE_MS,
+  HIGHLIGHT_THROTTLE_MS,
+  PERF_HINT_THRESHOLD,
+  createThrottle,
+  formatCharCount,
+  shouldWarnPerf,
+} from '@/utils/perfGuard'
 
 const session = useSessionStore()
 const doc = useDocStore()
@@ -105,6 +113,51 @@ const highlightHtml = computed(() => {
   // 末尾零宽字符：保证最后一行（空行）高度与 textarea 一致
   return html + '\u200b'
 })
+
+/* ---------------- 大文档性能保护：高频刷新节流 ---------------- */
+
+/**
+ * 实际渲染到 backdrop 的 HTML。
+ * highlightHtml 的任一依赖变化都会全量重算整层 HTML，大文档下单次成本高；
+ * 多人协作时远程光标消息（每用户约 120ms 一条）会高频触发该重算，引发卡顿。
+ * 因此：
+ * - 正文变化：立即刷新，保证 backdrop 与 textarea 严格对齐（否则高亮错位）；
+ * - 远程光标 / 批注标记 / 激活态等指示变化：节流合并，最多每 200ms 重算一次。
+ */
+const renderedHighlightHtml = ref(highlightHtml.value)
+let lastRenderedText = doc.text
+
+const throttledRenderHighlight = createThrottle(() => {
+  renderedHighlightHtml.value = highlightHtml.value
+  lastRenderedText = doc.text
+}, HIGHLIGHT_THROTTLE_MS)
+
+watch(highlightHtml, () => {
+  if (doc.text !== lastRenderedText) {
+    throttledRenderHighlight.cancel()
+    renderedHighlightHtml.value = highlightHtml.value
+    lastRenderedText = doc.text
+  } else {
+    throttledRenderHighlight()
+  }
+})
+
+/* ---------------- 正文字符统计与性能提示（节流刷新） ---------------- */
+
+/** 状态条显示的字符数：输入/粘贴/远程操作都会高频改变它，节流刷新避免每次按键重渲染 */
+const displayCharCount = ref(doc.text.length)
+
+const throttledUpdateCount = createThrottle(() => {
+  displayCharCount.value = doc.text.length
+}, COUNT_THROTTLE_MS)
+
+watch(
+  () => doc.text.length,
+  () => throttledUpdateCount(),
+)
+
+/** 超过预设阈值：提示性能影响（协作高亮已降频） */
+const perfWarn = computed(() => shouldWarnPerf(displayCharCount.value))
 
 /* ---------------- 滚动同步 ---------------- */
 
@@ -229,7 +282,11 @@ onMounted(() => {
   })
 })
 
-onBeforeUnmount(() => unregisterRemote?.())
+onBeforeUnmount(() => {
+  unregisterRemote?.()
+  throttledRenderHighlight.cancel()
+  throttledUpdateCount.cancel()
+})
 
 /* ---------------- 批注定位 ---------------- */
 
@@ -253,40 +310,52 @@ watch(
 </script>
 
 <template>
-  <div ref="wrapRef" class="editor-wrap">
-    <div ref="backdropRef" class="editor-backdrop" aria-hidden="true">
-      <div class="backdrop-content" v-html="highlightHtml"></div>
+  <div class="editor-root">
+    <div class="editor-status">
+      <span class="char-count" :class="{ warn: perfWarn }">正文 {{ formatCharCount(displayCharCount) }} 字符</span>
+      <el-tooltip
+        v-if="perfWarn"
+        :content="`已超过 ${formatCharCount(PERF_HINT_THRESHOLD)} 字符的性能阈值：协作高亮刷新已降频，编辑可能出现卡顿`"
+        placement="bottom"
+      >
+        <el-tag size="small" type="warning" effect="light">⚠ 文档较大，性能可能受影响</el-tag>
+      </el-tooltip>
     </div>
-    <textarea
-      ref="taRef"
-      class="editor-textarea"
-      :value="doc.text"
-      :readonly="!session.canEdit"
-      :placeholder="session.canEdit ? '开始输入，内容将实时同步给协作者…' : '当前身份为只读/批注，无法编辑正文'"
-      spellcheck="false"
-      @input="onInput"
-      @scroll="syncScroll"
-      @select="reportSelection"
-      @compositionstart="onCompositionStart"
-      @compositionend="onCompositionEnd"
-    ></textarea>
+    <div ref="wrapRef" class="editor-wrap">
+      <div ref="backdropRef" class="editor-backdrop" aria-hidden="true">
+        <div class="backdrop-content" v-html="renderedHighlightHtml"></div>
+      </div>
+      <textarea
+        ref="taRef"
+        class="editor-textarea"
+        :value="doc.text"
+        :readonly="!session.canEdit"
+        :placeholder="session.canEdit ? '开始输入，内容将实时同步给协作者…' : '当前身份为只读/批注，无法编辑正文'"
+        spellcheck="false"
+        @input="onInput"
+        @scroll="syncScroll"
+        @select="reportSelection"
+        @compositionstart="onCompositionStart"
+        @compositionend="onCompositionEnd"
+      ></textarea>
 
-    <div v-if="annFabPos && !annPopVisible" class="ann-fab" :style="{ top: annFabPos.top + 'px', left: annFabPos.left + 'px' }">
-      <el-button size="small" type="warning" @click="openAnnPop">💬 批注</el-button>
-    </div>
+      <div v-if="annFabPos && !annPopVisible" class="ann-fab" :style="{ top: annFabPos.top + 'px', left: annFabPos.left + 'px' }">
+        <el-button size="small" type="warning" @click="openAnnPop">💬 批注</el-button>
+      </div>
 
-    <div v-if="annPopVisible && annFabPos" class="ann-pop" :style="{ top: annFabPos.top + 'px', left: annFabPos.left + 'px' }">
-      <el-input
-        v-model="annDraft"
-        type="textarea"
-        :rows="3"
-        maxlength="500"
-        placeholder="输入批注内容…"
-        @keydown.esc="closeAnnPop"
-      />
-      <div class="ann-pop-actions">
-        <el-button size="small" @click="closeAnnPop">取消</el-button>
-        <el-button size="small" type="primary" @click="submitAnn">提交</el-button>
+      <div v-if="annPopVisible && annFabPos" class="ann-pop" :style="{ top: annFabPos.top + 'px', left: annFabPos.left + 'px' }">
+        <el-input
+          v-model="annDraft"
+          type="textarea"
+          :rows="3"
+          maxlength="500"
+          placeholder="输入批注内容…"
+          @keydown.esc="closeAnnPop"
+        />
+        <div class="ann-pop-actions">
+          <el-button size="small" @click="closeAnnPop">取消</el-button>
+          <el-button size="small" type="primary" @click="submitAnn">提交</el-button>
+        </div>
       </div>
     </div>
   </div>
